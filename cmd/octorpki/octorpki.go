@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/cfrpki/sync/lib"
@@ -226,9 +227,10 @@ type state struct {
 	Key          *ecdsa.PrivateKey
 	EnableCache  bool
 
-	Stable      bool // Indicates something has been added to the fetch list (rsync of rrdp)
-	Fetcher     *syncpki.LocalFetch
-	HTTPFetcher *syncpki.HTTPFetcher
+	Stable            bool // Indicates something has been added to the fetch list (rsync of rrdp)
+	HasPreviousStable bool
+	Fetcher           *syncpki.LocalFetch
+	HTTPFetcher       *syncpki.HTTPFetcher
 
 	PrevRepos    map[string]time.Time
 	CurrentRepos map[string]time.Time
@@ -240,7 +242,8 @@ type state struct {
 	RRDPInfo     map[string]RRDPInfo
 	RRDPFailover bool
 
-	ROAList *prefixfile.ROAList
+	ROAList     *prefixfile.ROAList
+	ROAListLock *sync.RWMutex
 
 	// Various counters and statistics
 	RRDPStats          map[string]Stats
@@ -935,11 +938,13 @@ func (s *state) MainValidation(pSpan opentracing.Span) {
 		sSpan.Finish()
 	}
 
+	s.ROAListLock.Lock()
 	s.ROAList = roalist
+	s.ROAListLock.Unlock()
 }
 
 func (s *state) ServeROAs(w http.ResponseWriter, r *http.Request) {
-	if s.Stable || !s.WaitStable {
+	if s.Stable || !s.WaitStable || s.HasPreviousStable {
 
 		upTo := s.LastComputed.Add(s.Validity)
 		maxAge := int(upTo.Sub(time.Now()).Seconds())
@@ -950,7 +955,9 @@ func (s *state) ServeROAs(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%v", maxAge))
 		}
 
+		s.ROAListLock.RLock()
 		tmp := s.ROAList
+		s.ROAListLock.RUnlock()
 
 		etag := sha256.New()
 		etag.Write([]byte(fmt.Sprintf("%v/%v", tmp.Metadata.Generated, tmp.Metadata.Counts)))
@@ -1198,6 +1205,7 @@ func main() {
 		ROAList: &prefixfile.ROAList{
 			Data: make([]prefixfile.ROAJson, 0),
 		},
+		ROAListLock: &sync.RWMutex{},
 
 		RsyncStats:    make(map[string]Stats),
 		RRDPStats:     make(map[string]Stats),
@@ -1315,6 +1323,7 @@ func main() {
 
 		// Reduce
 		s.Stable = !s.MainReduce() && s.Iteration > 1
+		s.HasPreviousStable = s.Stable
 
 		t2 = time.Now().UTC()
 		MetricOperationTime.With(
